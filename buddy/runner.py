@@ -261,7 +261,8 @@ class ProjectRunner:
             await self._review_loop(agent, task_fresh, pr, repo_dir, repo_url_local, stack)
 
         except Exception as exc:
-            agent.log(f"ERROR: {exc}", level="error")
+            import traceback
+            agent.log(f"ERROR: {exc}\n{traceback.format_exc()}", level="error")
             with SessionLocal() as session:
                 update_task(session, task_id, status="failed")
                 update_agent(session, agent_id, status="failed")
