@@ -443,11 +443,16 @@ class BaseAgent:
 REVIEW COMMENTS TO ADDRESS:
 {comments_text}
 
-Instructions:
-1. Call `list_files` on "." to see the existing code structure.
-2. Read the relevant files mentioned in the comments.
-3. Fix every issue raised — don't skip any.
-4. Call `finish` when all comments have been addressed with a brief summary.
+IMPORTANT RULES:
+- You MUST call `write_file` for every file that needs changes — even tiny fixes must be written.
+- Do NOT just read files and call `finish` — that is wrong. You must write the fixes.
+- Address every single comment. Do not skip any.
+- After writing all fixes, call `finish` with a summary of what you changed and why.
+
+Workflow:
+1. Call `list_files` on "." to understand the project structure.
+2. For each comment: call `read_file` on the relevant file, then call `write_file` with the fix applied.
+3. Once all comments are addressed with actual file writes, call `finish`.
 """
         return await self.run_tool_loop(repo_path, system, prompt)
 

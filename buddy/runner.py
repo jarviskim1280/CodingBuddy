@@ -320,22 +320,45 @@ class ProjectRunner:
             comments = review.comments or []
             previous_comments = comments
 
-            comment_body = "**Changes requested:**\n" + "\n".join(
-                f"- `{c.get('file', '?')}`: {c.get('issue', '')} — {c.get('suggestion', '')}"
-                for c in comments
+            comment_body = (
+                f"**🔍 Review round {round_num} — changes requested ({len(comments)} issues):**\n\n"
+                + "\n".join(
+                    f"- `{c.get('file', '?')}` — {c.get('issue', '')}. "
+                    f"*Suggestion: {c.get('suggestion', '')}*"
+                    for c in comments
+                )
             )
             self.github.post_review_comment(repo_url, pr, comment_body)
-            reviewer.log(f"Sent {len(comments)} review comments to worker.")
+            reviewer.log(f"Posted {len(comments)} review comments — handing back to worker.")
             reviewer.set_status("waiting")
 
             worker_agent.set_status("working", task.id)
-            worker_agent.log(f"Addressing {len(comments)} review comments (round {round_num})")
-            worker_agent.checkout_branch(repo_dir, pr.head)
-            await worker_agent.do_address_comments(task, repo_dir, stack, comments)
-            worker_agent.commit_and_push(
-                repo_dir, pr.head, f"fix: address review comments round {round_num}"
-            )
+            worker_agent.log(f"Checking out branch '{pr.head}' to address review comments (round {round_num})")
 
+            try:
+                worker_agent.checkout_branch(repo_dir, pr.head)
+            except Exception as exc:
+                worker_agent.log(f"Failed to checkout branch '{pr.head}': {exc}", level="error")
+                raise
+
+            worker_agent.log(f"Addressing {len(comments)} review comments…")
+            summary = await worker_agent.do_address_comments(task, repo_dir, stack, comments)
+            worker_agent.log(f"Address comments complete: {summary}")
+
+            try:
+                worker_agent.commit_and_push(
+                    repo_dir, pr.head,
+                    f"fix: address review comments round {round_num}\n\n"
+                    + "\n".join(f"- {c.get('issue', '')}" for c in comments[:10])
+                )
+            except Exception as exc:
+                worker_agent.log(f"Failed to push addressing commit: {exc}", level="error")
+                raise
+
+            self.github.post_review_comment(
+                repo_url, pr,
+                f"✏️ Round {round_num} comments addressed — pushed fixes to `{pr.head}`."
+            )
             worker_agent.set_status("waiting", task.id)
             reviewer.set_status("working", task.id)
 
