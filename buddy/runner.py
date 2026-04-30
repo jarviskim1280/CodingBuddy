@@ -104,10 +104,12 @@ class ProjectRunner:
         for task in tasks:
             if task.status == "done":
                 continue
-            elif task.status == "review" and task.pr_url and task.branch:
+            elif task.pr_url and task.branch:
+                # PR is already open (review state, or failed after PR was opened)
+                # — re-enter the review loop instead of redoing the work
                 to_review.append(task)
             else:
-                # pending / in_progress / failed → reset and re-run
+                # pending / in_progress / failed with no PR yet → reset and re-run
                 with SessionLocal() as session:
                     update_task(session, task.id, status="pending", assigned_agent_id=None)
                 to_restart.append(task)
