@@ -408,16 +408,33 @@ class BaseAgent:
                 name = block.name
                 inp = block.input
 
+                is_error = False
                 if name == "write_file":
-                    result = self._write_file(repo_path, inp["path"], inp["content"])
+                    path = inp.get("path", "")
+                    content = inp.get("content")
+                    if content is None:
+                        # Claude sometimes omits 'content' when tool JSON is truncated
+                        self.log(
+                            f"WARNING: write_file called without 'content' for '{path}' — "
+                            "asking Claude to retry",
+                            level="warning",
+                        )
+                        result = (
+                            f"'content' field was missing for path '{path}'. "
+                            "Your previous tool call was truncated. "
+                            "Please call write_file again with the FULL 'path' and 'content'. "
+                            "If the file is large, split it into smaller logical sections and write each separately."
+                        )
+                        is_error = True
+                    else:
+                        result = self._write_file(repo_path, path, content)
                 elif name == "read_file":
-                    result = self._read_file(repo_path, inp["path"])
+                    result = self._read_file(repo_path, inp.get("path", ""))
                 elif name == "list_files":
                     result = self._list_files(repo_path, inp.get("path", "."))
                 elif name == "report_unexpected_work":
-                    # Run the 3-step decision flow asynchronously
                     result = await self._handle_unexpected_work(
-                        finding=inp["finding"],
+                        finding=inp.get("finding", ""),
                         can_handle_inline=inp.get("can_handle_inline", False),
                         inline_plan=inp.get("inline_plan", ""),
                     )
@@ -428,11 +445,14 @@ class BaseAgent:
                 else:
                     result = f"Unknown tool: {name}"
 
-                tool_results.append({
+                tr: dict = {
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": result,
-                })
+                }
+                if is_error:
+                    tr["is_error"] = True
+                tool_results.append(tr)
 
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
