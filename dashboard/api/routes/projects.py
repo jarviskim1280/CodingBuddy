@@ -1,15 +1,29 @@
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from buddy.db.ops import (
     SessionLocal,
+    create_project,
     get_project,
     list_projects,
     list_tasks,
     list_agents,
+    update_project,
 )
+from buddy.github_client import get_github_client
+from buddy.orchestrator import apply_plan_to_db, plan_project
+from buddy.runner import ProjectRunner
+from dashboard.api.ws import broadcast_event
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+# ── Shared serialisers ────────────────────────────────────────────────────────
+
+def _fmt_dt(dt) -> str:
+    return dt.isoformat() if dt else ""
 
 
 class ProjectOut(BaseModel):
@@ -20,9 +34,6 @@ class ProjectOut(BaseModel):
     stack: dict
     status: str
     created_at: str
-
-    class Config:
-        from_attributes = True
 
 
 class TaskOut(BaseModel):
@@ -35,9 +46,6 @@ class TaskOut(BaseModel):
     pr_url: str
     assigned_agent_id: int | None
 
-    class Config:
-        from_attributes = True
-
 
 class AgentOut(BaseModel):
     id: int
@@ -47,18 +55,13 @@ class AgentOut(BaseModel):
     current_task_id: int | None
     last_heartbeat: str | None
 
-    class Config:
-        from_attributes = True
-
 
 class ProjectDetailOut(ProjectOut):
     tasks: list[TaskOut]
     agents: list[AgentOut]
 
 
-def _fmt_dt(dt) -> str:
-    return dt.isoformat() if dt else ""
-
+# ── GET /projects/ ────────────────────────────────────────────────────────────
 
 @router.get("/", response_model=list[ProjectOut])
 def get_projects():
@@ -77,6 +80,8 @@ def get_projects():
             for p in projects
         ]
 
+
+# ── GET /projects/{id} ────────────────────────────────────────────────────────
 
 @router.get("/{project_id}", response_model=ProjectDetailOut)
 def get_project_detail(project_id: int):
@@ -119,4 +124,72 @@ def get_project_detail(project_id: int):
                 )
                 for a in agents
             ],
+        )
+
+
+# ── POST /projects/ ───────────────────────────────────────────────────────────
+
+class CreateProjectRequest(BaseModel):
+    description: str
+
+
+async def _run_pipeline(project_id: int, plan: dict):
+    """Background task: run agents and broadcast events."""
+    runner = ProjectRunner(project_id, broadcast_fn=broadcast_event)
+    try:
+        await runner.run(plan)
+    except Exception as exc:
+        await broadcast_event({
+            "type": "project_error",
+            "project_id": project_id,
+            "error": str(exc),
+        })
+
+
+@router.post("/", response_model=ProjectOut, status_code=201)
+async def create_new_project(body: CreateProjectRequest):
+    if not body.description.strip():
+        raise HTTPException(status_code=400, detail="Description cannot be empty")
+
+    # 1. Plan with Claude
+    await broadcast_event({"type": "pipeline_status", "step": "planning", "message": "Planning project with Claude…"})
+    plan = await plan_project(body.description)
+    project_name = plan["project_name"]
+
+    # 2. Create DB record
+    with SessionLocal() as session:
+        project = create_project(session, project_name, body.description)
+        project_id = project.id
+
+    # 3. Create repo
+    await broadcast_event({"type": "pipeline_status", "step": "repo", "message": f"Creating repo: {project_name}…"})
+    github = get_github_client()
+    repo_url = github.create_repo(project_name, body.description)
+
+    with SessionLocal() as session:
+        update_project(session, project_id, repo_url=repo_url)
+
+    # 4. Store tasks from plan
+    apply_plan_to_db(type("P", (), {"id": project_id})(), plan)
+
+    await broadcast_event({
+        "type": "project_created",
+        "project_id": project_id,
+        "name": project_name,
+        "message": f"Project '{project_name}' created — launching agents…",
+    })
+
+    # 5. Kick off agents as a non-blocking asyncio task on the running loop
+    asyncio.create_task(_run_pipeline(project_id, plan))
+
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        return ProjectOut(
+            id=project.id,
+            name=project.name,
+            description=project.description,
+            repo_url=project.repo_url or "",
+            stack=project.stack or {},
+            status=project.status,
+            created_at=_fmt_dt(project.created_at),
         )
