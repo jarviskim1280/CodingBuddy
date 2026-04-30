@@ -60,6 +60,14 @@ export default function ProjectDetail() {
     const res = await fetch(`/api/projects/${id}`);
     if (!res.ok) return;
     const data = await res.json();
+    // Keep only the latest agent per type (highest ID wins)
+    const latestByType = Object.values(
+      (data.agents as Agent[]).reduce((acc: Record<string, Agent>, a: Agent) => {
+        if (!acc[a.type] || a.id > acc[a.type].id) acc[a.type] = a;
+        return acc;
+      }, {})
+    ) as Agent[];
+    data.agents = latestByType.sort((a, b) => a.type.localeCompare(b.type));
     setProject(data);
     if (data.agents.length > 0 && selectedAgent == null) {
       setSelectedAgent(data.agents[0].id);

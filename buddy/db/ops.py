@@ -96,6 +96,25 @@ def next_pending_task(session: Session, project_id: int, task_type: str) -> Opti
 # ── Agents ────────────────────────────────────────────────────────────────────
 
 def create_agent(session: Session, project_id: int, agent_type: str) -> Agent:
+    """Create a new agent, or reuse the most recent one of this type if it's idle/done/failed."""
+    existing = (
+        session.query(Agent)
+        .filter(
+            Agent.project_id == project_id,
+            Agent.type == agent_type,
+            Agent.status.in_(["idle", "done", "failed"]),
+        )
+        .order_by(Agent.id.desc())
+        .first()
+    )
+    if existing:
+        existing.status = "idle"
+        existing.current_task_id = None
+        existing.last_heartbeat = datetime.utcnow()
+        session.commit()
+        session.refresh(existing)
+        return existing
+
     agent = Agent(project_id=project_id, type=agent_type)
     session.add(agent)
     session.commit()
