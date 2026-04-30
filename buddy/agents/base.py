@@ -335,6 +335,28 @@ class BaseAgent:
             return "frontend"
         return "backend"
 
+    # ── API call with rate-limit backoff ──────────────────────────────────────
+
+    async def _api_call_with_backoff(self, **kwargs):
+        """Call the Anthropic API, retrying on 429 rate-limit errors with exponential backoff."""
+        import anthropic as _anthropic
+        delays = [15, 30, 60, 120]  # seconds between retries
+        for attempt, delay in enumerate(delays + [None]):
+            try:
+                return await self.client.messages.create(**kwargs)
+            except _anthropic.RateLimitError as e:
+                if delay is None:
+                    raise
+                self.log(f"Rate limit hit — retrying in {delay}s (attempt {attempt + 1})", level="warning")
+                await asyncio.sleep(delay)
+            except _anthropic.APIStatusError as e:
+                if e.status_code == 529:  # overloaded
+                    wait = delays[min(attempt, len(delays) - 1)]
+                    self.log(f"API overloaded — retrying in {wait}s", level="warning")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
     # ── Claude tool loop ──────────────────────────────────────────────────────
 
     async def run_tool_loop(
@@ -350,7 +372,7 @@ class BaseAgent:
         summary = ""
 
         for iteration in range(40):
-            response = await self.client.messages.create(
+            response = await self._api_call_with_backoff(
                 model=settings.claude_model,
                 max_tokens=8096,
                 system=system,

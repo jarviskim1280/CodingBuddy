@@ -129,11 +129,16 @@ class ProjectRunner:
         for bt in backend_restart:
             await self._run_worker(bt, clone_url, workspace, stack)
 
+        # Stagger parallel agents by 10s each to avoid simultaneous rate-limit spikes
+        async def _staggered(coro, delay: float):
+            await asyncio.sleep(delay)
+            return await coro
+
         parallel = []
-        for t in other_restart:
-            parallel.append(self._run_worker(t, clone_url, workspace, stack))
-        for t in to_review:
-            parallel.append(self._resume_review_loop(t, clone_url, workspace, repo_url, stack))
+        for i, t in enumerate(other_restart):
+            parallel.append(_staggered(self._run_worker(t, clone_url, workspace, stack), i * 10))
+        for i, t in enumerate(to_review):
+            parallel.append(_staggered(self._resume_review_loop(t, clone_url, workspace, repo_url, stack), i * 10))
 
         if parallel:
             await asyncio.gather(*parallel)

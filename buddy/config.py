@@ -18,7 +18,8 @@ class Settings(BaseSettings):
     github_username: str = ""
     github_org: str = ""
 
-    database_url: str = "sqlite:///./codingbuddy.db"
+    # Use absolute path so every process (CLI, dashboard, agents) shares the same DB
+    database_url: str = f"sqlite:///{Path(__file__).parent.parent / 'codingbuddy.db'}"
     repo_workspace: Path = Path("/tmp/codingbuddy_repos")
     dashboard_port: int = 8080
 

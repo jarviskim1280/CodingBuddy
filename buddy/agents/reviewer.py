@@ -87,7 +87,7 @@ class ReviewerAgent(BaseAgent):
             {"role": "user", "content": f"Review this pull request for task: {task.description}\n\n{context}"}
         ]
 
-        response = await self.client.messages.create(
+        response = await self._api_call_with_backoff(
             model=settings.claude_model,
             max_tokens=4096,
             system=REVIEW_SYSTEM,
