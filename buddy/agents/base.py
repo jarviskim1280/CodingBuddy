@@ -338,19 +338,27 @@ class BaseAgent:
     # ── API call with rate-limit backoff ──────────────────────────────────────
 
     async def _api_call_with_backoff(self, **kwargs):
-        """Call the Anthropic API, retrying on 429 rate-limit errors with exponential backoff."""
+        """Call the Anthropic API, retrying on 429/529 errors with exponential backoff.
+
+        Retries up to 8 times with increasing delays (total ~18 min of patience).
+        This handles sustained rate-limit pressure from large message histories.
+        """
         import anthropic as _anthropic
-        delays = [15, 30, 60, 120]  # seconds between retries
+        # Delays in seconds — generous to handle sustained 30k TPM exhaustion
+        delays = [30, 60, 90, 120, 180, 240, 300, 300]
         for attempt, delay in enumerate(delays + [None]):
             try:
                 return await self.client.messages.create(**kwargs)
-            except _anthropic.RateLimitError as e:
+            except _anthropic.RateLimitError:
                 if delay is None:
                     raise
-                self.log(f"Rate limit hit — retrying in {delay}s (attempt {attempt + 1})", level="warning")
+                self.log(
+                    f"Rate limit hit — retrying in {delay}s (attempt {attempt + 1}/{len(delays)})",
+                    level="warning",
+                )
                 await asyncio.sleep(delay)
             except _anthropic.APIStatusError as e:
-                if e.status_code == 529:  # overloaded
+                if e.status_code == 529:  # API overloaded
                     wait = delays[min(attempt, len(delays) - 1)]
                     self.log(f"API overloaded — retrying in {wait}s", level="warning")
                     await asyncio.sleep(wait)
@@ -372,9 +380,11 @@ class BaseAgent:
         summary = ""
 
         for iteration in range(40):
-            # Small pause between iterations to reduce token/min rate
+            # Pause between iterations to keep input-token/min rate under the limit.
+            # Large file contents in message history can easily push each call to
+            # 8-15k input tokens; 10s spacing gives the bucket time to refill.
             if iteration > 0:
-                await asyncio.sleep(3)
+                await asyncio.sleep(10)
 
             response = await self._api_call_with_backoff(
                 model=settings.claude_model,
