@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+
+# DB & workspace
+*.db
+*.sqlite
+codingbuddy.db
+/tmp/
+
+# Node
+node_modules/
+dashboard/ui/dist/
+
+# Misc
+.DS_Store
+*.log
