@@ -119,14 +119,7 @@ class ProjectRunner:
             "skipped_done": sum(1 for t in tasks if t.status == "done"),
         })
 
-        # Restart crashed/pending tasks (backend first)
-        backend_restart = [t for t in to_restart if t.type == "backend"]
-        other_restart = [t for t in to_restart if t.type != "backend"]
-
-        for bt in backend_restart:
-            await self._run_worker(bt, clone_url, workspace, stack)
-
-        # Run sequentially to stay under rate limits
+        # Restart crashed/pending tasks sequentially: backend → frontend → tests
         ordered_restart = (
             [t for t in to_restart if t.type == "backend"]
             + [t for t in to_restart if t.type == "frontend"]
