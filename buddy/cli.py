@@ -117,6 +117,46 @@ def dashboard(
     )
 
 
+@app.command()
+def resume(project_id: int = typer.Argument(..., help="Project ID to resume")):
+    """Resume a paused or partially failed project from where it left off."""
+    _ensure_db()
+    asyncio.run(_resume_project(project_id))
+
+
+async def _resume_project(project_id: int):
+    from buddy.db.ops import SessionLocal, get_project, list_tasks
+    from buddy.runner import ProjectRunner
+
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if not project:
+            console.print(f"[red]Project {project_id} not found.[/red]")
+            raise typer.Exit(1)
+        tasks = list_tasks(session, project_id)
+
+    done = sum(1 for t in tasks if t.status == "done")
+    review = sum(1 for t in tasks if t.status == "review")
+    pending = sum(1 for t in tasks if t.status in ("pending", "in_progress", "failed"))
+
+    console.print(f"\n[bold cyan]Resuming project #{project_id}:[/bold cyan] {project.name}")
+    console.print(f"  ✅ Done:            {done}")
+    console.print(f"  🔍 In review:       {review}  (will re-enter review loop)")
+    console.print(f"  🔄 Restarting:      {pending}  (will re-run from scratch)\n")
+
+    if done == len(tasks):
+        console.print("[green]All tasks already done — nothing to resume.[/green]")
+        return
+
+    runner = ProjectRunner(project_id, broadcast_fn=None)
+    try:
+        await runner.resume()
+        console.print(f"\n✅ [green]Project '{project.name}' complete![/green]")
+    except Exception as exc:
+        console.print(f"\n[red]Error resuming project:[/red] {exc}")
+        raise typer.Exit(1)
+
+
 @app.command("list")
 def list_projects():
     """List all projects."""

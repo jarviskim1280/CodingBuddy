@@ -1,6 +1,7 @@
 """Runner — spawns and coordinates worker + reviewer agents."""
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -15,6 +16,7 @@ from buddy.db.ops import (
     create_agent,
     get_project,
     get_task,
+    latest_review,
     list_tasks,
     update_agent,
     update_project,
@@ -30,6 +32,12 @@ AGENT_CLASSES = {
 }
 
 
+def _extract_pr_number(pr_url: str) -> int:
+    """Parse the PR number from a mock://pr/N or GitHub PR URL."""
+    match = re.search(r"/(\d+)$", pr_url.rstrip("/"))
+    return int(match.group(1)) if match else 0
+
+
 class ProjectRunner:
     """Orchestrates all agents for a single project."""
 
@@ -41,34 +49,22 @@ class ProjectRunner:
         self.project_id = project_id
         self.broadcast_fn = broadcast_fn
         self.github = get_github_client()
-        self._tasks: list[asyncio.Task] = []
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    # ── Full pipeline (new project) ───────────────────────────────────────────
 
     async def run(self, plan: dict):
         """Run the full pipeline: clone → parallel workers → review loop → merge."""
         with SessionLocal() as session:
             project = get_project(session, self.project_id)
-            repo_url = project.repo_url
             stack = project.stack or {}
             tasks = list_tasks(session, self.project_id)
-            # detach
             session.expunge_all()
 
-        # clone url may need token injection
-        clone_url = self.github.clone_url(repo_url)
-
-        # workspace for this project
+        clone_url = self.github.clone_url(project.repo_url)
         workspace = settings.repo_workspace / f"project_{self.project_id}"
         workspace.mkdir(parents=True, exist_ok=True)
 
-        # spawn one async task per worker agent type
-        coros = []
-        for task in tasks:
-            if task.type in AGENT_CLASSES:
-                coros.append(self._run_worker(task, clone_url, workspace, stack))
-
-        # run backend first (frontend + tests might depend on it)
+        # Run backend first, then frontend + tests in parallel
         backend_tasks = [t for t in tasks if t.type == "backend"]
         other_tasks = [t for t in tasks if t.type != "backend"]
 
@@ -85,6 +81,118 @@ class ProjectRunner:
 
         await self._broadcast({"type": "project_done", "project_id": self.project_id})
 
+    # ── Resume (restart from last known good state) ───────────────────────────
+
+    async def resume(self):
+        """Resume a partially completed project without redoing finished work."""
+        with SessionLocal() as session:
+            project = get_project(session, self.project_id)
+            if not project:
+                raise ValueError(f"Project {self.project_id} not found")
+            stack = project.stack or {}
+            repo_url = project.repo_url
+            tasks = list_tasks(session, self.project_id)
+            session.expunge_all()
+
+        clone_url = self.github.clone_url(repo_url)
+        workspace = settings.repo_workspace / f"project_{self.project_id}"
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        to_restart: list[Task] = []   # pending / in_progress / failed → re-run from scratch
+        to_review: list[Task] = []    # review → PR exists, re-enter review loop
+
+        for task in tasks:
+            if task.status == "done":
+                continue
+            elif task.status == "review" and task.pr_url and task.branch:
+                to_review.append(task)
+            else:
+                # pending / in_progress / failed → reset and re-run
+                with SessionLocal() as session:
+                    update_task(session, task.id, status="pending", assigned_agent_id=None)
+                to_restart.append(task)
+
+        await self._broadcast({
+            "type": "resume",
+            "project_id": self.project_id,
+            "restarting": len(to_restart),
+            "resuming_review": len(to_review),
+            "skipped_done": sum(1 for t in tasks if t.status == "done"),
+        })
+
+        # Restart crashed/pending tasks (backend first)
+        backend_restart = [t for t in to_restart if t.type == "backend"]
+        other_restart = [t for t in to_restart if t.type != "backend"]
+
+        for bt in backend_restart:
+            await self._run_worker(bt, clone_url, workspace, stack)
+
+        parallel = []
+        for t in other_restart:
+            parallel.append(self._run_worker(t, clone_url, workspace, stack))
+        for t in to_review:
+            parallel.append(self._resume_review_loop(t, clone_url, workspace, repo_url, stack))
+
+        if parallel:
+            await asyncio.gather(*parallel)
+
+        all_tasks_now = []
+        with SessionLocal() as session:
+            all_tasks_now = list_tasks(session, self.project_id)
+            session.expunge_all()
+
+        if all(t.status == "done" for t in all_tasks_now):
+            with SessionLocal() as session:
+                update_project(session, self.project_id, status="done")
+            await self._broadcast({"type": "project_done", "project_id": self.project_id})
+
+    async def _resume_review_loop(
+        self,
+        task: Task,
+        clone_url: str,
+        workspace: Path,
+        repo_url: str,
+        stack: dict,
+    ):
+        """Re-enter the review loop for a task whose PR is already open."""
+        agent_type = task.type
+        AgentClass = AGENT_CLASSES.get(agent_type)
+        if not AgentClass:
+            return
+
+        with SessionLocal() as session:
+            agent_rec = create_agent(session, self.project_id, agent_type)
+            agent_id = agent_rec.id
+            update_task(session, task.id, assigned_agent_id=agent_id)
+
+        worker: BackendAgent = AgentClass(agent_id, self.project_id)
+        worker.broadcast_fn = self.broadcast_fn
+        worker.set_status("waiting", task.id)
+        worker.log(f"Resuming review loop for existing PR: {task.pr_url}")
+
+        repo_dir = workspace / agent_type
+        try:
+            worker.clone_repo(clone_url, repo_dir)
+            worker.checkout_branch(repo_dir, task.branch)
+        except Exception as exc:
+            worker.log(f"Could not checkout branch {task.branch}: {exc}", level="error")
+            return
+
+        pr = PullRequest(
+            number=_extract_pr_number(task.pr_url),
+            url=task.pr_url,
+            title=f"[{agent_type}] {task.description[:60]}",
+            head=task.branch,
+        )
+
+        # Figure out which review round to start from
+        with SessionLocal() as session:
+            last_review = latest_review(session, task.id)
+            next_round = (last_review.round_number + 1) if last_review else 1
+
+        worker.log(f"Resuming from review round {next_round}")
+        await self._review_loop(worker, task, pr, repo_dir, repo_url, stack, start_round=next_round)
+
     # ── Worker lifecycle ──────────────────────────────────────────────────────
 
     async def _run_worker(
@@ -97,7 +205,6 @@ class ProjectRunner:
         agent_type = task.type
         AgentClass = AGENT_CLASSES[agent_type]
 
-        # create agent record
         with SessionLocal() as session:
             agent_rec = create_agent(session, self.project_id, agent_type)
             agent_id = agent_rec.id
@@ -110,7 +217,6 @@ class ProjectRunner:
         agent.set_status("working", task_id)
         agent.log(f"Starting task: {task.description}")
 
-        # each agent works in its own directory clone
         repo_dir = workspace / agent_type
         try:
             agent.clone_repo(clone_url, repo_dir)
@@ -121,7 +227,6 @@ class ProjectRunner:
             with SessionLocal() as session:
                 update_task(session, task_id, branch=branch)
 
-            # refresh task with branch set
             with SessionLocal() as session:
                 task_fresh = get_task(session, task_id)
                 session.expunge(task_fresh)
@@ -132,7 +237,6 @@ class ProjectRunner:
             commit_msg = f"feat({agent_type}): {task.description[:72]}"
             agent.commit_and_push(repo_dir, branch, commit_msg)
 
-            # open PR
             with SessionLocal() as session:
                 proj = get_project(session, self.project_id)
                 repo_url_local = proj.repo_url
@@ -152,7 +256,6 @@ class ProjectRunner:
             agent.log(f"Opened PR: {pr.url}")
             agent.set_status("waiting", task_id)
 
-            # run review loop
             await self._review_loop(agent, task_fresh, pr, repo_dir, repo_url_local, stack)
 
         except Exception as exc:
@@ -172,6 +275,7 @@ class ProjectRunner:
         repo_dir: Path,
         repo_url: str,
         stack: dict,
+        start_round: int = 1,
     ):
         with SessionLocal() as session:
             reviewer_rec = create_agent(session, self.project_id, "reviewer")
@@ -183,7 +287,7 @@ class ProjectRunner:
 
         previous_comments: list = []
 
-        for round_num in range(1, settings.max_review_rounds + 1):
+        for round_num in range(start_round, settings.max_review_rounds + 1):
             reviewer.log(f"Review round {round_num} for PR {pr.url}")
 
             diff = self.github.get_pr_diff(repo_url, pr, repo_dir)
@@ -195,9 +299,7 @@ class ProjectRunner:
 
                 reviewer.log("PR approved — merging.")
                 self.github.merge_pr(repo_url, pr, repo_dir)
-
-                review_comment = f"✅ PR approved and merged (round {round_num})."
-                self.github.post_review_comment(repo_url, pr, review_comment)
+                self.github.post_review_comment(repo_url, pr, f"✅ PR approved and merged (round {round_num}).")
 
                 with SessionLocal() as session:
                     update_task(session, task.id, status="done")
@@ -208,7 +310,6 @@ class ProjectRunner:
                 reviewer.set_status("done")
                 return
 
-            # changes requested
             comments = review.comments or []
             previous_comments = comments
 
@@ -217,13 +318,11 @@ class ProjectRunner:
                 for c in comments
             )
             self.github.post_review_comment(repo_url, pr, comment_body)
-
             reviewer.log(f"Sent {len(comments)} review comments to worker.")
             reviewer.set_status("waiting")
+
             worker_agent.set_status("working", task.id)
             worker_agent.log(f"Addressing {len(comments)} review comments (round {round_num})")
-
-            # worker addresses comments
             worker_agent.checkout_branch(repo_dir, pr.head)
             await worker_agent.do_address_comments(task, repo_dir, stack, comments)
             worker_agent.commit_and_push(
