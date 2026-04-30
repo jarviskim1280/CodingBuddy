@@ -135,14 +135,15 @@ async def _resume_project(project_id: int):
             raise typer.Exit(1)
         tasks = list_tasks(session, project_id)
 
+    # Mirror the runner's routing logic: pr_url+branch → review loop, else restart
     done = sum(1 for t in tasks if t.status == "done")
-    review = sum(1 for t in tasks if t.status == "review")
-    pending = sum(1 for t in tasks if t.status in ("pending", "in_progress", "failed"))
+    to_review = sum(1 for t in tasks if t.status != "done" and t.pr_url and t.branch)
+    to_restart = sum(1 for t in tasks if t.status != "done" and not (t.pr_url and t.branch))
 
     console.print(f"\n[bold cyan]Resuming project #{project_id}:[/bold cyan] {project.name}")
     console.print(f"  ✅ Done:            {done}")
-    console.print(f"  🔍 In review:       {review}  (will re-enter review loop)")
-    console.print(f"  🔄 Restarting:      {pending}  (will re-run from scratch)\n")
+    console.print(f"  🔍 In review:       {to_review}  (will re-enter review loop)")
+    console.print(f"  🔄 Restarting:      {to_restart}  (will re-run from scratch)\n")
 
     if done == len(tasks):
         console.print("[green]All tasks already done — nothing to resume.[/green]")
