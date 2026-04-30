@@ -122,25 +122,3 @@ class ReviewerAgent(BaseAgent):
 
         return review
 
-    async def do_address_comments(
-        self,
-        task: Task,
-        repo_path: Path,
-        stack: dict,
-        comments: list,
-    ) -> str:
-        """Worker-side: given review comments, fix the code."""
-        comments_text = json.dumps(comments, indent=2)
-        system = self.build_system_prompt(task, stack)
-        prompt = f"""You are addressing code review feedback for task: {task.description}
-
-REVIEW COMMENTS TO ADDRESS:
-{comments_text}
-
-Instructions:
-1. Call `list_files` on "." to see existing code.
-2. Read the relevant files.
-3. Fix each issue mentioned in the review comments.
-4. Call `finish` when all comments have been addressed.
-"""
-        return await self.run_tool_loop(repo_path, system, prompt)

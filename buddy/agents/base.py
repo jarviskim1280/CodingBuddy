@@ -403,6 +403,32 @@ class BaseAgent:
 
         return summary
 
+    # ── Address review comments (called on worker agents by the runner) ────────
+
+    async def do_address_comments(
+        self,
+        task: Task,
+        repo_path: Path,
+        stack: dict,
+        comments: list,
+    ) -> str:
+        """Fix the code based on reviewer comments. Called on the worker agent."""
+        import json as _json
+        comments_text = _json.dumps(comments, indent=2)
+        system = self.build_system_prompt(task, stack)
+        prompt = f"""You are addressing code review feedback for task: {task.description}
+
+REVIEW COMMENTS TO ADDRESS:
+{comments_text}
+
+Instructions:
+1. Call `list_files` on "." to see the existing code structure.
+2. Read the relevant files mentioned in the comments.
+3. Fix every issue raised — don't skip any.
+4. Call `finish` when all comments have been addressed with a brief summary.
+"""
+        return await self.run_tool_loop(repo_path, system, prompt)
+
     # ── Subclass interface ────────────────────────────────────────────────────
 
     def build_system_prompt(self, task: Task, stack: dict) -> str:
