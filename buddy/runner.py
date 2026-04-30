@@ -64,17 +64,14 @@ class ProjectRunner:
         workspace = settings.repo_workspace / f"project_{self.project_id}"
         workspace.mkdir(parents=True, exist_ok=True)
 
-        # Run backend first, then frontend + tests in parallel
-        backend_tasks = [t for t in tasks if t.type == "backend"]
-        other_tasks = [t for t in tasks if t.type != "backend"]
-
-        for bt in backend_tasks:
-            await self._run_worker(bt, clone_url, workspace, stack)
-
-        if other_tasks:
-            await asyncio.gather(
-                *[self._run_worker(t, clone_url, workspace, stack) for t in other_tasks]
-            )
+        # Run agents fully sequentially to stay under rate limits
+        ordered = (
+            [t for t in tasks if t.type == "backend"]
+            + [t for t in tasks if t.type == "frontend"]
+            + [t for t in tasks if t.type == "tests"]
+        )
+        for t in ordered:
+            await self._run_worker(t, clone_url, workspace, stack)
 
         with SessionLocal() as session:
             update_project(session, self.project_id, status="done")
@@ -129,19 +126,17 @@ class ProjectRunner:
         for bt in backend_restart:
             await self._run_worker(bt, clone_url, workspace, stack)
 
-        # Stagger parallel agents by 10s each to avoid simultaneous rate-limit spikes
-        async def _staggered(coro, delay: float):
-            await asyncio.sleep(delay)
-            return await coro
+        # Run sequentially to stay under rate limits
+        ordered_restart = (
+            [t for t in to_restart if t.type == "backend"]
+            + [t for t in to_restart if t.type == "frontend"]
+            + [t for t in to_restart if t.type == "tests"]
+        )
+        for t in ordered_restart:
+            await self._run_worker(t, clone_url, workspace, stack)
 
-        parallel = []
-        for i, t in enumerate(other_restart):
-            parallel.append(_staggered(self._run_worker(t, clone_url, workspace, stack), i * 10))
-        for i, t in enumerate(to_review):
-            parallel.append(_staggered(self._resume_review_loop(t, clone_url, workspace, repo_url, stack), i * 10))
-
-        if parallel:
-            await asyncio.gather(*parallel)
+        for t in to_review:
+            await self._resume_review_loop(t, clone_url, workspace, repo_url, stack)
 
         all_tasks_now = []
         with SessionLocal() as session:

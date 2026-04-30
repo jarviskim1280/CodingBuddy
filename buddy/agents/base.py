@@ -372,6 +372,10 @@ class BaseAgent:
         summary = ""
 
         for iteration in range(40):
+            # Small pause between iterations to reduce token/min rate
+            if iteration > 0:
+                await asyncio.sleep(3)
+
             response = await self._api_call_with_backoff(
                 model=settings.claude_model,
                 max_tokens=8096,
